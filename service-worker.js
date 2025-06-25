@@ -1,12 +1,13 @@
-// Google Meet Audio Indicator Service Worker with Debug Logging
+// Google Meet Audio Indicator Service Worker with Transcription
 let activeTabId = null;
 let isMonitoring = false;
 let offscreenDocumentCreated = false;
 
-// Track audio states for different tabs
+// Track audio states and transcriptions for different tabs
 const tabAudioStates = new Map();
+const tabTranscriptions = new Map();
 
-console.log('[Service Worker] Google Meet Audio Indicator loaded');
+console.log('[Service Worker] Google Meet Audio Indicator with Transcription loaded');
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   activeTabId = activeInfo.tabId;
@@ -21,6 +22,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (tabAudioStates.has(tabId)) {
       tabAudioStates.delete(tabId);
     }
+    if (tabTranscriptions.has(tabId)) {
+      tabTranscriptions.delete(tabId);
+    }
     await updateIconForTab(tabId);
   }
   
@@ -32,13 +36,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   console.log('[Service Worker] Tab removed:', tabId);
   tabAudioStates.delete(tabId);
+  tabTranscriptions.delete(tabId);
   if (tabId === activeTabId) {
     activeTabId = null;
   }
 });
 
 // Listen for messages from content script and offscreen document
-chrome.runtime.onMessage.addListener(async (message, sender) => {
+chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
   console.log('[Service Worker] Message received:', message.type, message);
   
   switch (message.type) {
@@ -67,6 +72,7 @@ chrome.runtime.onMessage.addListener(async (message, sender) => {
         try {
           chrome.runtime.sendMessage({
             type: 'popup-update-status',
+            tabId: sender.tab.id,
             hasAudio: message.hasAudio,
             isSpeaking: message.isSpeaking
           });
@@ -94,11 +100,76 @@ chrome.runtime.onMessage.addListener(async (message, sender) => {
       }
       break;
       
+    case 'transcription-update':
+      if (message.tabId) {
+        console.log('[Service Worker] Transcription update for tab:', message.tabId);
+        
+        const currentTranscription = tabTranscriptions.get(message.tabId) || {
+          recentTranscripts: [],
+          currentInterim: ''
+        };
+        
+        tabTranscriptions.set(message.tabId, {
+          recentTranscripts: message.recentTranscripts || currentTranscription.recentTranscripts,
+          currentInterim: message.interimTranscript || '',
+          lastUpdate: Date.now()
+        });
+        
+        // Send update to popup if it's open
+        try {
+          chrome.runtime.sendMessage({
+            type: 'popup-transcription-update',
+            tabId: message.tabId,
+            finalTranscript: message.finalTranscript,
+            interimTranscript: message.interimTranscript,
+            recentTranscripts: message.recentTranscripts
+          });
+        } catch (e) {
+          // Popup might not be open, ignore error
+        }
+      }
+      break;
+      
     case 'get-tab-audio-state':
       // Return current state for popup
       const state = tabAudioStates.get(message.tabId);
+      const transcription = tabTranscriptions.get(message.tabId);
       console.log('[Service Worker] Returning tab audio state:', message.tabId, state);
-      return Promise.resolve({ state });
+      sendResponse({ 
+        state,
+        transcription
+      });
+      return true;
+      
+    case 'toggle-transcription':
+      if (message.tabId) {
+        console.log('[Service Worker] Toggling transcription for tab:', message.tabId, message.enabled);
+        
+        // Forward to offscreen document
+        chrome.runtime.sendMessage({
+          type: 'toggle-transcription',
+          target: 'offscreen',
+          data: {
+            tabId: message.tabId,
+            enabled: message.enabled
+          }
+        });
+        
+        // Store transcription state
+        await chrome.storage.local.set({
+          [`transcription_${message.tabId}`]: message.enabled
+        });
+      }
+      break;
+      
+    case 'debug-get-states':
+      console.log('[Service Worker] Current tab audio states:', Object.fromEntries(tabAudioStates));
+      console.log('[Service Worker] Current transcriptions:', Object.fromEntries(tabTranscriptions));
+      sendResponse({ 
+        audioStates: Object.fromEntries(tabAudioStates),
+        transcriptions: Object.fromEntries(tabTranscriptions)
+      });
+      return true;
   }
 });
 
@@ -118,7 +189,7 @@ async function startMonitoringTab(tabId) {
         await chrome.offscreen.createDocument({
           url: 'offscreen.html',
           reasons: ['USER_MEDIA'],
-          justification: 'Monitoring audio activity in Google Meet tabs'
+          justification: 'Monitoring audio activity and transcription in Google Meet tabs'
         });
         offscreenDocumentCreated = true;
       } else {
@@ -140,6 +211,24 @@ async function startMonitoringTab(tabId) {
       target: 'offscreen',
       data: { streamId, tabId }
     });
+
+    // Check if transcription was previously enabled for this tab
+    const result = await chrome.storage.local.get([`transcription_${tabId}`]);
+    const transcriptionEnabled = result[`transcription_${tabId}`] || false;
+    
+    if (transcriptionEnabled) {
+      // Enable transcription
+      setTimeout(() => {
+        chrome.runtime.sendMessage({
+          type: 'toggle-transcription',
+          target: 'offscreen',
+          data: {
+            tabId: tabId,
+            enabled: true
+          }
+        });
+      }, 1000);
+    }
 
   } catch (error) {
     console.error('[Service Worker] Failed to start monitoring:', error);
@@ -210,16 +299,15 @@ setInterval(() => {
   
   for (const [tabId, state] of tabAudioStates.entries()) {
     if (now - state.timestamp > maxAge) {
-      console.log('[Service Worker] Cleaning up old state for tab:', tabId);
+      console.log('[Service Worker] Cleaning up old audio state for tab:', tabId);
       tabAudioStates.delete(tabId);
     }
   }
-}, 10000);
-
-// Debug function to check current states
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'debug-get-states') {
-    console.log('[Service Worker] Current tab audio states:', Object.fromEntries(tabAudioStates));
-    sendResponse({ states: Object.fromEntries(tabAudioStates) });
+  
+  for (const [tabId, transcription] of tabTranscriptions.entries()) {
+    if (now - transcription.lastUpdate > maxAge) {
+      console.log('[Service Worker] Cleaning up old transcription for tab:', tabId);
+      tabTranscriptions.delete(tabId);
+    }
   }
-});
+}, 10000);

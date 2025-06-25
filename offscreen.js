@@ -1,6 +1,8 @@
-// Google Meet Audio Monitor Offscreen Document
+// Google Meet Audio Monitor Offscreen Document with Speech Recognition
 const activeStreams = new Map();
 const audioAnalysers = new Map();
+const speechRecognizers = new Map();
+const transcriptionStates = new Map();
 
 chrome.runtime.onMessage.addListener(async (message) => {
   if (message.target === 'offscreen') {
@@ -11,12 +13,19 @@ chrome.runtime.onMessage.addListener(async (message) => {
       case 'stop-audio-monitoring':
         stopAudioMonitoring(message.data.tabId);
         break;
+      case 'toggle-transcription':
+        toggleTranscription(message.data.tabId, message.data.enabled);
+        break;
+      case 'get-transcription-state':
+        return { enabled: transcriptionStates.get(message.data.tabId) || false };
     }
   }
 });
 
 async function startAudioMonitoring({ streamId, tabId }) {
   try {
+    console.log('[Offscreen] Starting audio monitoring for tab:', tabId);
+    
     // Stop existing monitoring for this tab
     if (activeStreams.has(tabId)) {
       stopAudioMonitoring(tabId);
@@ -30,7 +39,7 @@ async function startAudioMonitoring({ streamId, tabId }) {
           chromeMediaSourceId: streamId
         }
       },
-      video: false // Only audio monitoring
+      video: false
     });
 
     activeStreams.set(tabId, stream);
@@ -51,14 +60,155 @@ async function startAudioMonitoring({ streamId, tabId }) {
       analyser,
       dataArray,
       audioContext,
-      source
+      source,
+      stream
     });
 
     // Start monitoring audio levels
     monitorAudioLevel(tabId);
 
+    // Initialize speech recognition if supported
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      initializeSpeechRecognition(tabId, stream);
+    } else {
+      console.warn('[Offscreen] Speech recognition not supported in this browser');
+    }
+
   } catch (error) {
-    console.error('Failed to start audio monitoring:', error);
+    console.error('[Offscreen] Failed to start audio monitoring:', error);
+  }
+}
+
+function initializeSpeechRecognition(tabId, stream) {
+  try {
+    console.log('[Offscreen] Initializing speech recognition for tab:', tabId);
+    
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    
+    // Configure speech recognition
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
+    
+    let isRecognizing = false;
+    let lastTranscript = '';
+    let transcriptBuffer = [];
+    
+    recognition.onstart = () => {
+      console.log('[Offscreen] Speech recognition started for tab:', tabId);
+      isRecognizing = true;
+    };
+    
+    recognition.onresult = (event) => {
+      let interimTranscript = '';
+      let finalTranscript = '';
+      
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript + ' ';
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+      
+      // Only send updates if there's new content
+      if (finalTranscript || interimTranscript !== lastTranscript) {
+        lastTranscript = interimTranscript;
+        
+        // Add final transcript to buffer
+        if (finalTranscript.trim()) {
+          transcriptBuffer.push({
+            text: finalTranscript.trim(),
+            timestamp: Date.now(),
+            isFinal: true
+          });
+          
+          // Keep only last 50 entries to prevent memory buildup
+          if (transcriptBuffer.length > 50) {
+            transcriptBuffer = transcriptBuffer.slice(-50);
+          }
+        }
+        
+        // Send transcription update
+        chrome.runtime.sendMessage({
+          type: 'transcription-update',
+          tabId: tabId,
+          finalTranscript: finalTranscript.trim(),
+          interimTranscript: interimTranscript.trim(),
+          recentTranscripts: transcriptBuffer.slice(-5) // Send last 5 entries
+        }).catch(err => console.log('[Offscreen] Error sending transcription:', err));
+      }
+    };
+    
+    recognition.onerror = (event) => {
+      console.error('[Offscreen] Speech recognition error:', event.error);
+      
+      // Restart recognition on certain errors
+      if (event.error === 'network' || event.error === 'audio-capture') {
+        setTimeout(() => {
+          if (transcriptionStates.get(tabId) && !isRecognizing) {
+            try {
+              recognition.start();
+            } catch (e) {
+              console.log('[Offscreen] Could not restart recognition:', e);
+            }
+          }
+        }, 1000);
+      }
+    };
+    
+    recognition.onend = () => {
+      console.log('[Offscreen] Speech recognition ended for tab:', tabId);
+      isRecognizing = false;
+      
+      // Restart if transcription is still enabled
+      if (transcriptionStates.get(tabId)) {
+        setTimeout(() => {
+          try {
+            recognition.start();
+          } catch (e) {
+            console.log('[Offscreen] Could not restart recognition:', e);
+          }
+        }, 100);
+      }
+    };
+    
+    speechRecognizers.set(tabId, {
+      recognition,
+      isRecognizing: () => isRecognizing,
+      transcriptBuffer
+    });
+    
+  } catch (error) {
+    console.error('[Offscreen] Failed to initialize speech recognition:', error);
+  }
+}
+
+function toggleTranscription(tabId, enabled) {
+  console.log('[Offscreen] Toggling transcription for tab:', tabId, 'enabled:', enabled);
+  
+  transcriptionStates.set(tabId, enabled);
+  const recognizer = speechRecognizers.get(tabId);
+  
+  if (!recognizer) {
+    console.warn('[Offscreen] No speech recognizer found for tab:', tabId);
+    return;
+  }
+  
+  try {
+    if (enabled && !recognizer.isRecognizing()) {
+      recognizer.recognition.start();
+      console.log('[Offscreen] Started transcription for tab:', tabId);
+    } else if (!enabled && recognizer.isRecognizing()) {
+      recognizer.recognition.stop();
+      console.log('[Offscreen] Stopped transcription for tab:', tabId);
+    }
+  } catch (error) {
+    console.error('[Offscreen] Error toggling transcription:', error);
   }
 }
 
@@ -69,7 +219,7 @@ function monitorAudioLevel(tabId) {
   const { analyser, dataArray } = analyserData;
 
   const checkAudioLevel = () => {
-    if (!audioAnalysers.has(tabId)) return; // Stop if monitoring was stopped
+    if (!audioAnalysers.has(tabId)) return;
 
     analyser.getByteFrequencyData(dataArray);
     
@@ -81,8 +231,8 @@ function monitorAudioLevel(tabId) {
     const average = sum / dataArray.length;
     
     // Determine if there's significant audio activity
-    const hasAudio = average > 10; // Threshold for audio detection
-    const audioLevel = average / 255; // Normalize to 0-1
+    const hasAudio = average > 10;
+    const audioLevel = average / 255;
 
     // Send audio state to service worker
     chrome.runtime.sendMessage({
@@ -90,16 +240,32 @@ function monitorAudioLevel(tabId) {
       tabId: tabId,
       hasAudio: hasAudio,
       audioLevel: audioLevel
-    });
+    }).catch(err => console.log('[Offscreen] Error sending audio state:', err));
 
     // Continue monitoring
-    setTimeout(checkAudioLevel, 100); // Check every 100ms
+    setTimeout(checkAudioLevel, 100);
   };
 
   checkAudioLevel();
 }
 
 function stopAudioMonitoring(tabId) {
+  console.log('[Offscreen] Stopping audio monitoring for tab:', tabId);
+  
+  // Stop speech recognition
+  const recognizer = speechRecognizers.get(tabId);
+  if (recognizer) {
+    try {
+      recognizer.recognition.stop();
+    } catch (e) {
+      console.log('[Offscreen] Error stopping recognition:', e);
+    }
+    speechRecognizers.delete(tabId);
+  }
+  
+  // Stop transcription state
+  transcriptionStates.delete(tabId);
+  
   // Stop stream
   const stream = activeStreams.get(tabId);
   if (stream) {
@@ -110,7 +276,11 @@ function stopAudioMonitoring(tabId) {
   // Clean up audio analysis
   const analyserData = audioAnalysers.get(tabId);
   if (analyserData) {
-    analyserData.audioContext.close();
+    try {
+      analyserData.audioContext.close();
+    } catch (e) {
+      console.log('[Offscreen] Error closing audio context:', e);
+    }
     audioAnalysers.delete(tabId);
   }
 }
