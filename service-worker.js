@@ -49,6 +49,17 @@ chrome.runtime.onMessage.addListener(async (message, sender) => {
           timestamp: Date.now()
         });
         await updateIconForTab(sender.tab.id);
+        
+        // Send update to popup if it's open
+        try {
+          chrome.runtime.sendMessage({
+            type: 'popup-update-status',
+            hasAudio: message.hasAudio,
+            isSpeaking: message.isSpeaking
+          });
+        } catch (e) {
+          // Popup might not be open, ignore error
+        }
       }
       break;
       
@@ -64,6 +75,11 @@ chrome.runtime.onMessage.addListener(async (message, sender) => {
         await updateIconForTab(message.tabId);
       }
       break;
+      
+    case 'get-tab-audio-state':
+      // Return current state for popup
+      const state = tabAudioStates.get(message.tabId);
+      return Promise.resolve({ state });
   }
 });
 
@@ -124,7 +140,7 @@ async function updateIconForTab(tabId) {
     } else if (state.hasTabAudio || state.hasAudio) {
       // Tab has audio (others speaking)
       iconPath = 'icons/listening.png';
-      badgeText = 'AUDIO';
+      badgeText = '♪';
       badgeColor = '#2196F3'; // Blue
     }
   }
